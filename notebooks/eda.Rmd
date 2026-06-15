@@ -1,0 +1,61 @@
+---
+
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(tmap)
+```
+
+Load the data:
+
+```{r}
+cre_sf <- st_read("../data/processed/london_cre_2023_spatial.gpkg", quiet = TRUE)
+```
+
+Process:
+
+```{r}
+cre_unique <- cre_sf %>%
+  group_by(postcode) %>%
+  summarize(
+    median_price = median(price, na.rm = TRUE)
+  ) %>%
+  mutate(log_price = log(median_price))
+
+cat("Number of unique spatial CRE locations:", nrow(cre_unique), "\n")
+```
+
+Clusters in space:
+
+```{r}
+tmap_mode("view")
+
+tm_shape(cre_unique) +
+  tm_dots(col = "log_price", 
+          style = "quantile", 
+          palette = "Viridis", 
+          title = "Log(Median Price)",
+          size = 0.5,
+          alpha = 0.8) +
+  tm_layout(title = "London CRE Volatility Clusters (2023)")
+```
+
+Moran's I with KNN to show spatial autocorrelation.
+
+```{r}
+coords <- st_coordinates(cre_unique)
+
+knn_5 <- knearneigh(coords, k = 5)
+nb_5 <- knn2nb(knn_5)
+
+listw_5 <- nb2listw(nb_5, style = "W")
+
+moran_result <- moran.test(cre_unique$log_price, listw_5)
+print(moran_result)
+```

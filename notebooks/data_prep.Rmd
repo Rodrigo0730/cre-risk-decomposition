@@ -1,0 +1,48 @@
+Data engineering:
+
+```{r}
+cre_sf <- st_read("../data/processed/london_cre_2023_spatial.gpkg", quiet = TRUE)
+city_center <- st_sfc(st_point(c(-0.0886, 51.5145)), crs = 4326)
+```
+
+```{r}
+cre_unique <- cre_sf %>%
+  group_by(postcode) %>%
+  summarize(median_price = median(price, na.rm = TRUE)) %>%
+  mutate(log_price = log(median_price)) %>%
+  st_jitter(amount = 0.0001)
+```
+
+```{r}
+cre_unique$dist_to_center <- as.numeric(st_distance(cre_unique, city_center))
+buffer_zones <- st_buffer(cre_unique, dist = 1000)
+cre_unique$local_density <- lengths(st_intersects(cre_unique, buffer_zones))
+```
+
+```{r}
+cre_multivariate <- cre_unique %>%
+  rename(
+    Value = log_price,
+    Centrality = dist_to_center,
+    Liquidity = local_density
+  )
+```
+
+Safety checks on out 3-variate dataset.
+
+```{r}
+library(moments)
+kurtosis_results <- cre_multivariate %>%
+  st_drop_geometry() %>%  
+  select(Value, Centrality, Liquidity) %>%
+  summarise(across(everything(), ~ kurtosis(.x, na.rm = TRUE)))
+
+print(kurtosis_results)
+```
+
+Save the dataset:
+
+```{r}
+final_data_path <- "../data/processed/londonCRE.gpkg"
+st_write(cre_multivariate, final_data_path, delete_dsn = TRUE, quiet = TRUE)
+```

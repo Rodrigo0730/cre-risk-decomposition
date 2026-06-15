@@ -1,0 +1,493 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Libraries:
+
+```{r}
+library(SpatialBSS)
+library(sf)
+library(spdep)
+library(dplyr)
+library(JADE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggspatial)
+library(maptiles)
+library(gstat)
+?sbss
+```
+
+Load the 3-variate spatial dataset.
+
+```{r}
+data <- st_read("../data/processed/londonCRE.gpkg", quiet=TRUE)
+```
+
+We build the spatial kernel functions which we will utilize also for spJADE.
+
+```{r}
+#we project to meters instead of longitude/latitude
+cre <- st_transform(data, crs = 27700)
+coords <- st_coordinates(cre)
+bandwidths <- c(0, 1000, 
+                1000, 3850, 
+                3850, 8450, 
+                8450, 22000)
+kernel_list <- spatial_kernel_matrix(coords, 
+                                     kernel_type = "ring",
+                                     kernel_parameters=bandwidths)
+```
+
+Prepare for sbss:
+
+```{r}
+X <- data %>%
+  st_drop_geometry() %>%
+  select(Value, Centrality, Liquidity) %>%
+  as.matrix()
+
+n <- nrow(X)
+kernel_list_f0 <- c(list(diag(1, n, n)), kernel_list)
+Sf_list_f0 <- lapply(kernel_list_f0, function(kmat) {
+  sum(kmat) / nrow(kmat)
+})
+Sf_list <- Sf_list_f0[-1]
+```
+
+We implemented normalization and check if it affects the frjd efficiency.
+
+```{r}
+sbss_res <- sbss(x=X, kernel_list=kernel_list)
+print(sbss_res)
+```
+
+Now we run the spJADE method:
+
+```{r}
+source("../src/spICA.R")
+```
+
+Without f0 kernel:
+
+```{r}
+spjade_res <- spjade(
+  x = X, 
+  kernel_list = kernel_list, 
+  Sf_list = Sf_list
+)
+print(spjade_res$w)
+```
+
+```{r}
+spjade_f0_res <- spjade(
+  x = X, 
+  kernel_list = kernel_list_f0, 
+  Sf_list = Sf_list_f0
+)
+print(spjade_f0_res$w)
+```
+
+Classic JADE:
+
+```{r}
+jade_res <- JADE(X)
+print(jade_res$W)
+```
+
+Store results to dataset:
+
+```{r}
+cre$spjade_IC1 <- spjade_res$s[, 1]
+cre$spjade_IC2 <- spjade_res$s[, 2]
+cre$spjade_IC3 <- spjade_res$s[, 3]
+
+```
+
+```{r}
+df_density <- data.frame(
+  IC1 = scale(spjade_res$s[, 1]), 
+  IC3 = scale(spjade_res$s[, 2]),
+  IC2 = scale(spjade_res$s[, 3])
+)
+
+df_long <- pivot_longer(df_density, cols = everything(), names_to = "Component", values_to = "Value")
+
+plot_density <- ggplot(df_long, aes(x = Value)) + 
+  geom_density(aes(fill = Component, color = Component), alpha = 0.15, linewidth = 0.4) +
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 1), color = "#444444", linetype = "dashed", linewidth = 0.3) +
+  coord_cartesian(xlim = c(-5, 5)) +
+  theme_classic(base_size = 14, base_family = "sans") +
+  theme(
+    axis.line = element_line(color = "#333333", linewidth = 0.3),
+    axis.ticks = element_line(color = "#333333", linewidth = 0.3),
+    axis.text = element_text(color = "#333333"),
+    axis.title = element_text(margin = margin(t = 12, r = 12)),
+    legend.position = "right",       
+    legend.title = element_blank(),   
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.8, "cm"),
+    plot.margin = margin(20, 20, 20, 20),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA)
+  ) +
+  labs(
+    x = "Standard Deviations", 
+    y = "Density"
+  ) +
+  scale_fill_manual(
+    values = c("IC1" = "#E64B35", "IC2" = "#00A087", "IC3" = "#4DBBD5"),
+    labels = c("IC1" = "IC1", "IC2" = "IC2", "IC3" = "IC3")
+  ) +
+  scale_color_manual(
+    values = c("IC1" = "#E64B35", "IC2" = "#00A087", "IC3" = "#4DBBD5"),
+    labels = c("IC1" = "IC1", "IC2" = "IC2", "IC3" = "IC3")
+  )
+
+print(plot_density)
+```
+
+```{r}
+cre_projected <- st_transform(cre, 3857)
+london <- get_tiles(cre_projected, provider="CartoDB.PositronNoLabels", zoom=11)
+```
+
+Independent component 1
+
+```{r}
+IC1_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(aes(color = spjade_IC1, alpha= abs(spjade_IC1)), size = 0.8, alpha = 1, stroke = 0) +
+  scale_color_gradient2(
+    low = "#5E3C99",
+    mid = "#D9D9D9",
+    high = "#E66101",
+    midpoint = 0,
+    name = ""
+  ) +
+  scale_alpha_continuous(
+    range = c(0.10, 1), 
+    limits = c(0, 1), 
+    oob = scales::squish, 
+    guide = "none"
+  ) +
+  theme_void() + theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom")
+  )
+print(IC1_plot)
+```
+
+Independent component 2:
+
+```{r}
+IC2_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(aes(color = spjade_IC2, alpha= abs(spjade_IC2)), size = 0.8, alpha = 1, stroke = 0) +
+  scale_color_gradient2(
+    low = "#5E3C99",
+    mid = "#D9D9D9",
+    high = "#E66101",
+    midpoint = 0,
+    name = ""
+  ) +
+  scale_alpha_continuous(
+    range = c(0.1, 1), 
+    limits = c(0, 2), 
+    oob = scales::squish, 
+    guide = "none"
+  ) +
+  theme_void() + theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom")
+  )
+print(IC2_plot)
+```
+
+Independent component 3:
+
+```{r}
+IC3_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(aes(color = spjade_IC3, alpha= abs(spjade_IC3)), size = 0.8, alpha = 1, stroke = 0) +
+  scale_color_gradient2(
+    low = "#5E3C99",
+    mid = "#D9D9D9",
+    high = "#E66101",
+    midpoint = 0,
+    name = ""
+  ) +
+  scale_alpha_continuous(
+    range = c(0.1, 1), 
+    limits = c(0, 2.5), 
+    oob = scales::squish, 
+    guide = "none"
+  ) +
+  theme_void() + theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom")
+  )
+print(IC3_plot)
+```
+
+```{r}
+for (i in 1:3){
+  print(kurtosis(jade_res$S[, i]))
+}
+
+for (i in 1:3){
+  print(kurtosis(spjade_res$s[, i]))
+}
+
+for (i in 1:3){
+  print(kurtosis(spjade_f0_res$s[, i]))
+}
+
+for (i in 1:3){
+  print(kurtosis(sbss_res$s[, i]))
+}
+```
+
+We assign components to reorganize them accordingly.
+
+```{r}
+cre$jade_IC1 <- jade_res$S[, 1]
+cre$jade_IC2 <- jade_res$S[, 3]
+cre$jade_IC3 <- jade_res$S[, 2]
+
+cre$spjade_f0_IC1 <- spjade_f0_res$s[, 1]
+cre$spjade_f0_IC2 <- spjade_f0_res$s[, 2]
+cre$spjade_f0_IC3 <- spjade_f0_res$s[, 3]
+
+cre$sbss_IC1 <- sbss_res$s[, 3]
+cre$sbss_IC2 <- sbss_res$s[, 1]
+cre$sbss_IC3 <- sbss_res$s[, 2]
+```
+
+Create spatial neighbor list for Moran's I.
+
+```{r}
+coords <- st_coordinates(cre)
+knn_obj <- knearneigh(coords, k = 6)
+nb_obj <- knn2nb(knn_obj)
+W_list <- nb2listw(nb_obj, style = "W", zero.policy = TRUE)
+```
+
+```{r}
+m_jade1 <- moran.test(as.numeric(cre$jade_IC1), W_list)
+m_spjade1 <- moran.test(as.numeric(cre$spjade_IC1), W_list)
+m_spjade_f0_1 <- moran.test(as.numeric(cre$spjade_f0_IC1), W_list)
+m_sbss1 <- moran.test(as.numeric(cre$sbss_IC1), W_list)
+
+
+comparison_IC1 <- data.frame(
+  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
+  Moran_I = c(m_jade1$estimate[1],
+              m_spjade1$estimate[1],
+              m_spjade_f0_1$estimate[1],
+              m_sbss1$estimate[1]
+              )
+)
+comparison_IC1
+```
+
+```{r}
+m_jade2 <- moran.test(as.numeric(cre$jade_IC2), W_list)
+m_spjade2 <- moran.test(as.numeric(cre$spjade_IC2), W_list)
+m_spjade_f0_2 <- moran.test(as.numeric(cre$spjade_f0_IC2), W_list)
+m_sbss2 <- moran.test(as.numeric(cre$sbss_IC2), W_list)
+
+
+comparison_IC2 <- data.frame(
+  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
+  Moran_I = c(m_jade2$estimate[1],
+              m_spjade2$estimate[1],
+              m_spjade_f0_2$estimate[1],
+              m_sbss2$estimate[1]
+  )
+)
+comparison_IC2
+```
+
+```{r}
+m_jade3 <- moran.test(as.numeric(cre$jade_IC3), W_list)
+m_spjade3 <- moran.test(as.numeric(cre$spjade_IC3), W_list)
+m_spjade_f0_3 <- moran.test(as.numeric(cre$spjade_f0_IC3), W_list)
+m_sbss3 <- moran.test(as.numeric(cre$sbss_IC3), W_list)
+
+
+comparison_IC3 <- data.frame(
+  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
+  Moran_I = c(m_jade3$estimate[1],
+              m_spjade3$estimate[1],
+              m_spjade_f0_3$estimate[1],
+              m_sbss3$estimate[1]
+  )
+)
+comparison_IC3
+```
+
+Variograms:
+
+```{r}
+vario_jade1   <- variogram(cre$jade_IC1 ~ 1, locations = cre)
+vario_spjade1 <- variogram(cre$spjade_IC1 ~ 1, locations = cre)
+vario_spjade_f0_1 <- variogram(cre$spjade_f0_IC1 ~ 1, locations = cre)
+vario_sbss1 <- variogram(cre$sbss_IC1 ~ 1, locations = cre)
+
+combined_vario1 <- rbind(
+  cbind(vario_jade1, method = "JADE"),
+  cbind(vario_spjade1, method = "spJADE"),
+  cbind(vario_spjade_f0_1, method = "spJADE_f0"),
+  cbind(vario_sbss1, method = "SBSS")
+)
+
+ggplot(combined_vario1, aes(x = dist, y = gamma, color = method, shape = method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Spatial Structure Comparison: IC1",
+       x = "Distance (meters)",
+       y = "Semivariance") +
+  scale_color_manual(values = c("JADE" = "blue",
+                                "spJADE" = "red",
+                                "spJADE_f0" = "green",
+                                "SBSS"= "violet"))
+```
+
+```{r}
+vario_jade2   <- variogram(cre$jade_IC2 ~ 1, locations = cre)
+vario_spjade2 <- variogram(cre$spjade_IC2 ~ 1, locations = cre)
+vario_spjade_f0_2 <- variogram(cre$spjade_f0_IC2 ~ 1, locations = cre)
+vario_sbss2 <- variogram(cre$sbss_IC2 ~ 1, locations = cre)
+
+combined_vario2 <- rbind(
+  cbind(vario_jade2, method = "JADE"),
+  cbind(vario_spjade2, method = "spJADE"),
+  cbind(vario_spjade_f0_2, method = "spJADE_f0"),
+  cbind(vario_sbss2, method = "SBSS")
+)
+
+
+ggplot(combined_vario2, aes(x = dist, y = gamma, color = method, shape = method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Spatial Structure Comparison: IC2",
+       x = "Distance (meters)",
+       y = "Semivariance") +
+  scale_color_manual(values = c("JADE" = "blue",
+                                "spJADE" = "red",
+                                "spJADE_f0" = "green",
+                                "SBSS"= "violet"))
+```
+
+```{r}
+vario_jade3   <- variogram(cre$jade_IC3 ~ 1, locations = cre)
+vario_spjade3 <- variogram(cre$spjade_IC3 ~ 1, locations = cre)
+vario_spjade_f0_3 <- variogram(cre$spjade_f0_IC3 ~ 1, locations = cre)
+vario_sbss3 <- variogram(cre$sbss_IC3 ~ 1, locations = cre)
+
+combined_vario <- rbind(
+  cbind(vario_jade3, method = "JADE"),
+  cbind(vario_spjade3, method = "spJADE"),
+  cbind(vario_spjade_f0_3, method = "spJADE_f0"),
+  cbind(vario_sbss3, method = "SBSS")
+)
+
+
+ggplot(combined_vario, aes(x = dist, y = gamma, color = method, shape = method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Spatial Structure Comparison: IC3",
+       x = "Distance (meters)",
+       y = "Semivariance") +
+  scale_color_manual(values = c("JADE" = "blue",
+                                "spJADE" = "red",
+                                "spJADE_f0" = "green",
+                                "SBSS"= "violet"))
+```
+
+Final table for each component:
+
+```{r}
+get_spatial_metrics <- function(vario_obj, method_name) {
+  nugget <- vario_obj$gamma[1]
+  sill <- max(vario_obj$gamma)
+  nugget_sill_ratio <- nugget / sill
+  
+  effective_range <- vario_obj$dist[which.max(vario_obj$gamma)]
+  
+  data.frame(
+    Method = method_name,
+    Nugget = round(nugget, 4),
+    Sill = round(sill, 4),
+    Ratio = round(nugget_sill_ratio, 4),
+    Range_Meters = round(effective_range, 0)
+  )
+}
+
+calculate_entropy <- function(vec) {
+  counts <- table(cut(vec, breaks = 50))
+  p <- counts / sum(counts)
+  p <- p[p > 0]
+  -sum(p * log(p))
+}
+
+```
+
+```{r}
+table_metrics <- rbind(
+  get_spatial_metrics(vario_jade1, "JADE"),
+  get_spatial_metrics(vario_spjade1, "spJADE"),
+  get_spatial_metrics(vario_spjade_f0_1, "spJADE_f0"),
+  get_spatial_metrics(vario_sbss1, "SBSS")
+)
+
+table_metrics$Entropy <- c(
+  calculate_entropy(jade_res$S[,1]),
+  calculate_entropy(spjade_res$s[,1]),
+  calculate_entropy(spjade_f0_res$s[,1]),
+  calculate_entropy(sbss_res$s[,1])
+)
+
+print(table_metrics)
+```
+
+```{r}
+table_metrics <- rbind(
+  get_spatial_metrics(vario_jade2, "JADE"),
+  get_spatial_metrics(vario_spjade2, "spJADE"),
+  get_spatial_metrics(vario_spjade_f0_2, "spJADE_f0"),
+  get_spatial_metrics(vario_sbss2, "SBSS")
+)
+
+table_metrics$Entropy <- c(
+  calculate_entropy(jade_res$S[,2]),
+  calculate_entropy(spjade_res$s[,2]),
+  calculate_entropy(spjade_f0_res$s[,2]),
+  calculate_entropy(sbss_res$s[,2])
+)
+print(table_metrics)
+```
+
+```{r}
+table_metrics <- rbind(
+  get_spatial_metrics(vario_jade3, "JADE"),
+  get_spatial_metrics(vario_spjade3, "spJADE"),
+  get_spatial_metrics(vario_spjade_f0_3, "spJADE_f0"),
+  get_spatial_metrics(vario_sbss3, "SBSS")
+)
+
+table_metrics$Entropy <- c(
+  calculate_entropy(jade_res$S[,3]),
+  calculate_entropy(spjade_res$s[,3]),
+  calculate_entropy(spjade_f0_res$s[,3]),
+  calculate_entropy(sbss_res$s[,3])
+)
+print(table_metrics)
+```
