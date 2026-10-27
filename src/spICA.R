@@ -1,6 +1,5 @@
 whiten_data <- function(X, na.action = na.fail) {
   # Whitening exactly as in from JADE:::FOBI
-
   X <- na.action(X)
   X <- as.matrix(X)
 
@@ -24,9 +23,7 @@ whiten_data <- function(X, na.action = na.fail) {
 
 compute_bkl <- function(k, l, kmat, Y) {
   # For n distinct locations, computes the fourth order cross-moment
-  # matrices B_f^{kl}. The computations are vectorized and kmat is
-  # a matrix such that the ij-th element corresponds to f(u_i - u_j).
-
+  # matrices B_f^{kl}.
   n <- nrow(Y)
   vkl <- Y[, k] * Y[, l]
   w <- as.vector(kmat %*% vkl)
@@ -46,8 +43,24 @@ compute_ckl <- function(k, l, kmat, lcov, Y, Sf) {
   return(as.matrix(Ckl))
 }
 
+# --- HELPER FUNCTION FOR IRREGULAR COORDINATES ---
+spectral_normalize_kernels <- function(kernels) {
+  lapply(kernels, function(kmat) {
+    # Calculate the largest eigenvalue (spectral radius)
+    # distance/contiguity matrices are naturally symmetric
+    max_eigen <- max(eigen(kmat, symmetric = TRUE, only.values = TRUE)$values)
 
-spjade <- function(x, kernel_list, Sf_list, eps = 1e-06, maxiter = 100) {
+    # Prevent division by zero if the matrix is completely empty
+    if (max_eigen == 0) {
+      max_eigen <- 1
+    }
+
+    return(kmat / max_eigen)
+  })
+}
+# -------------------------------------------------
+
+spjade <- function(x, kernel_list, Sf_list = NULL, eps = 1e-06, maxiter = 100) {
   x <- as.matrix(x)
   p <- ncol(x)
   K <- length(kernel_list)
@@ -58,11 +71,9 @@ spjade <- function(x, kernel_list, Sf_list, eps = 1e-06, maxiter = 100) {
   Y <- whitening$Y
   W0 <- whitening$W0
 
-  lcovs <- SpatialBSS::local_covariance_matrix(
-    x = Y,
-    kernel_list = kernel_list,
-    lcov = "lcov"
-  )
+  lcovs <- lapply(kernel_list, function(W) {
+    as.matrix(crossprod(Y, W %*% Y) / nrow(Y))
+  })
 
   C_array <- array(0, dim = c(p, p, p * p * K))
   idx <- 1
@@ -73,19 +84,13 @@ spjade <- function(x, kernel_list, Sf_list, eps = 1e-06, maxiter = 100) {
 
     for (k in 1:p) {
       for (l in 1:p) {
-        C_array[, , idx] <- compute_ckl(k, l, kmat, lcov, Y, Sf)
+        C_array[,, idx] <- compute_ckl(k, l, kmat, lcov, Y, Sf)
         idx <- idx + 1
       }
     }
   }
-  
+
   num_matrices <- dim(C_array)[3]
-  
-  for(i in 1:num_matrices) {
-    mat <- C_array[, , i]
-    f_norm <- norm(mat, type = "F")
-    C_array[, , i] <- mat / f_norm
-  }
 
   jd_res <- tryCatch(
     suppressWarnings(JADE::frjd(C_array, maxiter = maxiter, eps = eps)),
@@ -113,6 +118,67 @@ spjade <- function(x, kernel_list, Sf_list, eps = 1e-06, maxiter = 100) {
     x_mu = x_mu,
     d = jd_res$D,
     C_array = C_array
+  )
+
+  class(res) <- "sbss"
+
+  return(res)
+}
+
+spfobi <- function(x, kernels, eps = 1e-06, maxiter = 100) {
+  x <- as.matrix(x)
+
+  K <- length(kernels)
+  n <- nrow(x)
+  p <- ncol(x)
+
+  x_mu <- colMeans(x)
+
+  whitening <- whiten_data(x)
+  Y <- whitening$Y
+  W0 <- whitening$W0
+
+  B_array <- array(0, dim = c(p, p, K))
+
+  for (i in 1:K) {
+    kmat <- kernels[[i]]
+    B_sum <- matrix(0, p, p)
+    for (k in 1:p) {
+      B <- compute_bkl(k, k, kmat, Y)
+      B_sum <- B_sum + B
+    }
+
+    B_array[,, i] <- B_sum
+  }
+
+  num_matrices <- dim(B_array)[3]
+
+  jd_res <- tryCatch(
+    suppressWarnings(JADE::frjd(B_array, maxiter = maxiter, eps = eps)),
+    error = function(e) {
+      message("frjd failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (is.null(jd_res)) {
+    stop("Joint diagonalization failed.")
+  }
+
+  W_est <- crossprod(jd_res$V, W0)
+
+  x_centered <- sweep(x, 2, x_mu, "-")
+  s <- x_centered %*% t(W_est)
+
+  colnames(s) <- paste0("spFOBI_", 1:p)
+
+  res <- list(
+    s = s,
+    coords = NULL,
+    w = W_est,
+    x_mu = x_mu,
+    d = jd_res$D,
+    B_array = B_array
   )
 
   class(res) <- "sbss"

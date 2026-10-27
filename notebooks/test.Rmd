@@ -12,19 +12,13 @@ library(sf)
 library(spdep)
 library(dplyr)
 library(JADE)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(ggspatial)
-library(maptiles)
-library(gstat)
-?sbss
+library(moments)
 ```
 
 Load the 3-variate spatial dataset.
 
 ```{r}
-data <- st_read("../data/processed/londonCRE.gpkg", quiet=TRUE)
+data <- st_read("data/processed/londonCRE.gpkg", quiet=TRUE)
 ```
 
 We build the spatial kernel functions which we will utilize also for spJADE.
@@ -47,28 +41,100 @@ Prepare for sbss:
 ```{r}
 X <- data %>%
   st_drop_geometry() %>%
-  select(Value, Centrality, Liquidity) %>%
+  select(Value, Volatility, Liquidity) %>%
   as.matrix()
 
 n <- nrow(X)
-kernel_list_f0 <- c(list(diag(1, n, n)), kernel_list)
-Sf_list_f0 <- lapply(kernel_list_f0, function(kmat) {
+kernel_list <- c(list(diag(1, n, n)), kernel_list)
+Sf_list <- lapply(kernel_list_f0, function(kmat) {
   sum(kmat) / nrow(kmat)
 })
-Sf_list <- Sf_list_f0[-1]
 ```
 
 We implemented normalization and check if it affects the frjd efficiency.
 
 ```{r}
 sbss_res <- sbss(x=X, kernel_list=kernel_list)
-print(sbss_res)
+print(sbss_res$w)
 ```
 
 Now we run the spJADE method:
 
 ```{r}
 source("../src/spICA.R")
+#now rerun the experiments but without frobenius normalization
+spjade <- function(x, kernel_list, Sf_list, eps = 1e-06, maxiter = 100) {
+  x <- as.matrix(x)
+  p <- ncol(x)
+  K <- length(kernel_list)
+  
+  x_mu <- colMeans(x)
+  
+  whitening <- whiten_data(x)
+  Y <- whitening$Y
+  W0 <- whitening$W0
+  
+  lcovs <- SpatialBSS::local_covariance_matrix(
+    x = Y,
+    kernel_list = kernel_list,
+    lcov = "lcov"
+  )
+  
+  C_array <- array(0, dim = c(p, p, p * p * K))
+  idx <- 1
+  for (i in 1:K) {
+    kmat <- kernel_list[[i]]
+    lcov <- lcovs[[i]]
+    Sf <- Sf_list[[i]]
+    
+    for (k in 1:p) {
+      for (l in 1:p) {
+        C_array[, , idx] <- compute_ckl(k, l, kmat, lcov, Y, Sf)
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  # for (i in 1:K) {
+  #   slice_indices <- ((i - 1) * p * p + 1):(i * p * p)
+  #   block_norm <- sqrt(sum(C_array[, , slice_indices]^2))
+  #   if (block_norm > 1e-10) {
+  #     C_array[, , slice_indices] <- C_array[, , slice_indices] / block_norm
+  #   }
+  # }
+  
+  jd_res <- tryCatch(
+    suppressWarnings(JADE::frjd(C_array, maxiter = maxiter, eps = eps)),
+    error = function(e) {
+      message("frjd failed: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(jd_res)) {
+    stop("Joint diagonalization failed.")
+  }
+  
+  W_est <- crossprod(jd_res$V, W0)
+  
+  x_centered <- sweep(x, 2, x_mu, "-")
+  s <- x_centered %*% t(W_est)
+  
+  colnames(s) <- paste0("spJADE_", 1:p)
+  
+  res <- list(
+    s = s,
+    coords = NULL,
+    w = W_est,
+    x_mu = x_mu,
+    d = jd_res$D,
+    C_array = C_array
+  )
+  
+  class(res) <- "sbss"
+  
+  return(res)
+}
 ```
 
 Without f0 kernel:
@@ -263,8 +329,8 @@ cre$spjade_f0_IC2 <- spjade_f0_res$s[, 2]
 cre$spjade_f0_IC3 <- spjade_f0_res$s[, 3]
 
 cre$sbss_IC1 <- sbss_res$s[, 3]
-cre$sbss_IC2 <- sbss_res$s[, 1]
-cre$sbss_IC3 <- sbss_res$s[, 2]
+cre$sbss_IC2 <- sbss_res$s[, 2]
+cre$sbss_IC3 <- sbss_res$s[, 1]
 ```
 
 Create spatial neighbor list for Moran's I.

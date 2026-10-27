@@ -14,3 +14,9 @@ data/processed/*
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Editor settings, render intermediates and images not part of the analysis
+.vscode/
+*.rmarkdown
+Banner.jpg
+*.jpeg

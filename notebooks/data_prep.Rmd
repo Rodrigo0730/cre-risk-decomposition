@@ -1,30 +1,40 @@
 Data engineering:
 
 ```{r}
-cre_sf <- st_read("../data/processed/london_cre_2023_spatial.gpkg", quiet = TRUE)
-city_center <- st_sfc(st_point(c(-0.0886, 51.5145)), crs = 4326)
+cre_sf <- st_read("../data/processed/london_cre_2023_spatial.gpkg", quiet = TRUE) %>%
+  st_transform(27700)
+
+city_center <- st_sfc(st_point(c(-0.0886, 51.5145)), crs = 4326) %>%
+  st_transform(27700)
 ```
 
 ```{r}
 cre_unique <- cre_sf %>%
   group_by(postcode) %>%
   summarize(median_price = median(price, na.rm = TRUE)) %>%
-  mutate(log_price = log(median_price)) %>%
-  st_jitter(amount = 0.0001)
+  st_jitter(amount = 15)
 ```
 
 ```{r}
-cre_unique$dist_to_center <- as.numeric(st_distance(cre_unique, city_center))
 buffer_zones <- st_buffer(cre_unique, dist = 1000)
-cre_unique$local_density <- lengths(st_intersects(cre_unique, buffer_zones))
+intersections <- st_intersects(cre_unique, buffer_zones)
+```
+
+```{r}
+cre_unique$liquidity <- lengths(intersections)
+cre_unique$local_volatility <- sapply(intersections, function(idx) {
+  val <- sd(cre_unique$median_price[idx], na.rm = TRUE)
+  ifelse(is.na(val), 0, val)
+})
 ```
 
 ```{r}
 cre_multivariate <- cre_unique %>%
+  select(postcode, median_price, local_volatility, liquidity) %>%
   rename(
-    Value = log_price,
-    Centrality = dist_to_center,
-    Liquidity = local_density
+    Value = median_price,
+    Volatility = local_volatility,
+    Liquidity = liquidity
   )
 ```
 
@@ -34,10 +44,9 @@ Safety checks on out 3-variate dataset.
 library(moments)
 kurtosis_results <- cre_multivariate %>%
   st_drop_geometry() %>%  
-  select(Value, Centrality, Liquidity) %>%
-  summarise(across(everything(), ~ kurtosis(.x, na.rm = TRUE)))
+  summarise(across(c(Value, Volatility, Liquidity), ~ kurtosis(.x, na.rm = TRUE)))
 
-print(kurtosis_results)
+kurtosis_results
 ```
 
 Save the dataset:

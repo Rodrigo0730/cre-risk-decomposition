@@ -1,8 +1,5 @@
 ---
-
-editor_options: 
-  markdown: 
-    wrap: 72
+editor_options: markdown: wrap: 72 
 ---
 
 ```{r}
@@ -15,47 +12,276 @@ library(tmap)
 Load the data:
 
 ```{r}
-cre_sf <- st_read("../data/processed/london_cre_2023_spatial.gpkg", quiet = TRUE)
+cre_sf <- st_read("../data/processed/londonCRE.gpkg", quiet = TRUE)
 ```
 
-Process:
-
 ```{r}
-cre_unique <- cre_sf %>%
-  group_by(postcode) %>%
-  summarize(
-    median_price = median(price, na.rm = TRUE)
-  ) %>%
-  mutate(log_price = log(median_price))
-
-cat("Number of unique spatial CRE locations:", nrow(cre_unique), "\n")
+nrow(cre_sf)
 ```
 
 Clusters in space:
 
 ```{r}
-tmap_mode("view")
-
-tm_shape(cre_unique) +
-  tm_dots(col = "log_price", 
-          style = "quantile", 
-          palette = "Viridis", 
-          title = "Log(Median Price)",
-          size = 0.5,
-          alpha = 0.8) +
-  tm_layout(title = "London CRE Volatility Clusters (2023)")
+cre_projected <- st_transform(cre_sf, 3857)
+london <- get_tiles(cre_projected, provider="CartoDB.PositronNoLabels", zoom=11)
 ```
 
-Moran's I with KNN to show spatial autocorrelation.
+```{r}
+library(ggplot2)
+library(ggspatial) 
+
+value_plot <- ggplot(data = cre_projected %>% filter(Volatility > 0)) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = Value), 
+    size = 0.8,
+    alpha=0.7,
+    stroke = 0
+  ) +
+  scale_color_viridis_c(
+    option = "viridis",
+    name = NULL,
+    direction = 1,
+    trans = "log10"
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom"),
+    legend.title = element_text(face = "bold")
+  )
+
+print(value_plot)
+```
 
 ```{r}
-coords <- st_coordinates(cre_unique)
+library(scales)
+volatility_plot <- ggplot(data = cre_projected %>% filter(Volatility > 0)) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = Volatility), 
+    size = 0.5,
+    alpha=0.7,
+    stroke = 0
+  ) +
+  scale_color_viridis_c(
+    option = "magma",
+    name = NULL,
+    direction = 1,
+    trans = "log10"
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom")
+  )
 
-knn_5 <- knearneigh(coords, k = 5)
-nb_5 <- knn2nb(knn_5)
+print(volatility_plot)
+```
 
-listw_5 <- nb2listw(nb_5, style = "W")
+```{r}
+library(scales)
+library(ggplot2)
 
-moran_result <- moran.test(cre_unique$log_price, listw_5)
-print(moran_result)
+# 1. Build the plot with EPSG:3857 meter coordinates
+volatility_banner <- ggplot(data = cre_projected %>% filter(Volatility > 0)) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = Volatility), 
+    size = 0.075,
+    alpha = 0.9,
+    stroke = 0.15
+  )+
+  scale_color_viridis_c(     # Changed to 'scale_fill' to match the mapping above
+    option = "mako",
+    name = NULL,
+    direction = 1,
+    trans = "log10"
+  ) +
+  # --- THE PANORAMIC ZOOM (Strict 4:1 Ratio in Meters) ---
+  coord_sf(
+    xlim = c(-51000, 29000), 
+    ylim = c(6701000, 6721000), 
+    expand = FALSE 
+  )+
+  theme_void() + 
+  theme(
+    legend.position = "none",              
+    plot.margin = margin(0, 0, 0, 0, "cm")
+  )
+
+# 2. Save the perfectly proportioned image
+ggsave(
+  filename = "linkedin_header_volatility_magma.jpeg", 
+  plot = volatility_banner, 
+  device = "jpeg",
+  width = 1584, 
+  height = 396, 
+  units = "px",
+  dpi = 600
+)
+```
+
+```{r}
+liquidity_plot <- ggplot(data = cre_projected %>% filter(Volatility > 0)) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = Liquidity), 
+    size = 0.8,
+    alpha=0.7,
+    stroke = 0
+  ) +
+  scale_color_viridis_c(
+    option = "mako",
+    name = "",
+    direction = 1,
+    trans = "log10"
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom")
+  )
+
+print(liquidity_plot)
+```
+
+Descriptive statistics
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(sf)
+library(moments) # For skewness and kurtosis
+library(knitr)   # For LaTeX table generation
+
+# 1. Calculate the descriptive statistics
+summary_stats <- cre_projected %>%
+  st_drop_geometry() %>%
+  select(Value, Volatility, Liquidity) %>%
+  # Pivot the data so variables become rows (perfect for a table)
+  pivot_longer(
+    cols = everything(), 
+    names_to = "Variable", 
+    values_to = "Measurement"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Mean = mean(Measurement, na.rm = TRUE),
+    Median = median(Measurement, na.rm = TRUE),
+    `Std. Dev.` = sd(Measurement, na.rm = TRUE),
+    Skewness = skewness(Measurement, na.rm = TRUE),
+    Kurtosis = kurtosis(Measurement, na.rm = TRUE)
+  ) %>%
+  # Force the order to match your thesis layout (Value, Volatility, Liquidity)
+  arrange(match(Variable, c("Value", "Volatility", "Liquidity")))
+
+# 2. View the clean dataframe in R
+print(summary_stats)
+
+# 3. Generate the raw LaTeX code to copy/paste into your thesis
+print(kable(
+  summary_stats, 
+  format = "latex", 
+  booktabs = TRUE, 
+  digits = 2, # Rounds to 2 decimal places for clean formatting
+  caption = "\\textbf{Descriptive Statistics and Distributional Diagnostics.}"
+))
+```
+
+```{r}
+library(patchwork)
+combined_esda_plot <- value_plot | volatility_plot | liquidity_plot
+print(combined_esda_plot)
+```
+
+```{r}
+ggsave(
+  filename = "combined_esda_maps.pdf", 
+  plot = combined_esda_plot, 
+  width = 15, 
+  height = 5, 
+  dpi = 600,
+  device = cairo_pdf # Highly recommended for smooth vector graphics and font rendering
+)
+```
+
+morans I\
+
+```{r}
+coords <- st_coordinates(cre_projected)
+nb_1000 <- dnearneigh(coords, d1 = 0, d2 = 1000)
+
+# Handle the "islands" (properties with zero neighbors) using zero.policy = TRUE
+listw_1000 <- nb2listw(nb_1000, style = "W", zero.policy = TRUE)
+
+# 2. Define a custom function to run the Monte Carlo Moran's I and extract metrics
+get_moran_metrics <- function(variable_vector, listw_obj, nsim = 999) {
+  
+  # Set seed for exact reproducibility in your thesis
+  set.seed(42) 
+  
+  # Run the permutation test
+  mc_result <- moran.mc(variable_vector, listw = listw_obj, nsim = nsim, zero.policy = TRUE)
+  
+  # Extract the observed Moran's I statistic
+  moran_i <- mc_result$statistic
+  
+  # Calculate the empirical Z-score from the permutations
+  # (Observed - Mean of Simulations) / Std Dev of Simulations
+  simulated_values <- mc_result$res[1:nsim] # Drop the last value which is the observed stat
+  z_score <- (moran_i - mean(simulated_values)) / sd(simulated_values)
+  
+  # Extract the pseudo p-value
+  p_val <- mc_result$p.value
+  
+  # Format p-value for the table (e.g., if it's 0.001, write "< 0.001")
+  p_val_formatted <- ifelse(p_val <= 0.001, "< 0.001", sprintf("%.3f", p_val))
+  
+  return(c(
+    `Global Moran's I` = round(moran_i, 4),
+    `Z-score` = round(z_score, 2),
+    `p-value` = p_val_formatted
+  ))
+}
+
+# 3. Apply the function to your three variables
+variables_to_test <- c("Value", "Volatility", "Liquidity")
+
+# Create an empty list to store the results
+moran_results_list <- list()
+
+for (var in variables_to_test) {
+  # Drop geometry to pass just the numeric vector
+  vec <- cre_multivariate %>% st_drop_geometry() %>% pull(!!sym(var))
+  
+  # Run the metrics and store
+  metrics <- get_moran_metrics(vec, listw_1000)
+  moran_results_list[[var]] <- metrics
+}
+
+# 4. Bind into a clean dataframe
+moran_df <- bind_rows(moran_results_list, .id = "Variable")
+
+# Format the variable names to match the LaTeX math notation
+moran_df <- moran_df %>%
+  mutate(Variable = case_when(
+    Variable == "Value" ~ "Value ($V$)",
+    Variable == "Volatility" ~ "Volatility ($\\sigma$)",
+    Variable == "Liquidity" ~ "Liquidity ($L$)"
+  ))
+
+# 5. Print the results to the R console for your own review
+print(moran_df)
+
+# 6. Generate the thesis-ready LaTeX code
+kable(
+  moran_df, 
+  format = "latex", 
+  booktabs = TRUE,
+  escape = FALSE, # Allows the LaTeX math notation ($V$, $\sigma$) to render properly
+  align = c('l', 'c', 'c', 'c'),
+  caption = "\\textbf{Global Moran's I Spatial Autocorrelation Diagnostics.} P-values are derived via Monte Carlo permutations ($M=999$) under the null hypothesis of total spatial randomness."
+)
 ```

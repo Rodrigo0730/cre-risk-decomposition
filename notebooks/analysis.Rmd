@@ -15,63 +15,122 @@ library(JADE)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
-library(ggspatial)
-library(maptiles)
-library(gstat)
-?sbss
+library(moments)
 ```
 
 Load the 3-variate spatial dataset.
 
 ```{r}
-data <- st_read("../data/processed/londonCRE.gpkg", quiet=TRUE)
+data <- st_read("data/processed/londonCRE.gpkg", quiet=TRUE)
 ```
 
-We build the spatial kernel functions which we will utilize also for spJADE.
+We build the spatial kernel functions which we will utilize for SBSS, spFOBI and spJADE.
 
 ```{r}
-#we project to meters instead of longitude/latitude
+library(dbscan)
+library(Matrix)
+library(RSpectra)
+
+# 1. Project to meters
 cre <- st_transform(data, crs = 27700)
 coords <- st_coordinates(cre)
-bandwidths <- c(0, 1000, 
-                1000, 3850, 
-                3850, 8450, 
-                8450, 22000)
-kernel_list <- spatial_kernel_matrix(coords, 
-                                     kernel_type = "ring",
-                                     kernel_parameters=bandwidths)
+n <- nrow(coords)
+
+# 2. Define bandwidths (phi) in meters
+phi_values <- c(100, 250, 500, 1000)
+
+# 3. Build Truncated Sparse Exponential Kernels
+kernel_list_raw <- lapply(phi_values, function(phi) {
+  
+  # An exponential curve has a fatter tail than a Gaussian curve.
+  # We extend the cutoff to 5 * phi to safely capture the spatial signal 
+  # before truncating. (at 5*phi, the spatial weight is exp(-5) ≈ 0.006)
+  cutoff_dist <- 5 * phi 
+  
+  # Use the highly optimized KD-Tree to find neighbors within the new cutoff
+  nn <- dbscan::frNN(coords, eps = cutoff_dist)
+  
+  # Extract indices and distances
+  i <- rep(1:n, lengths(nn$id))
+  j <- unlist(nn$id)
+  d <- unlist(nn$dist)
+  
+  # Apply the Exponential decay formula: f(d) = exp(-d / phi)
+  weights <- exp(-d / phi)
+  
+  # Build the sparse symmetric matrix
+  W_sparse <- sparseMatrix(
+    i = i, 
+    j = j, 
+    x = weights, 
+    dims = c(n, n), 
+    symmetric = FALSE 
+  )
+  
+  # Add the self-relationship (distance = 0, exp(0) = 1) to the diagonal
+  diag(W_sparse) <- 1
+  
+  return(W_sparse)
+})
+
+# 4. Fast Spectral Normalization using Arnoldi Iteration
+spectral_normalize_sparse <- function(kernels) {
+  lapply(kernels, function(kmat) {
+    
+    # Standard eigen() calculates ALL 21,000 eigenvalues (O(N^3)).
+    # RSpectra::eigs_sym only calculates the top 1 eigenvalue directly.
+    # On an M1, this reduces computation time from hours to milliseconds.
+    max_eigen <- RSpectra::eigs_sym(kmat, k = 1, which = "LA")$values
+    
+    if (max_eigen == 0) max_eigen <- 1 
+    
+    return(kmat / max_eigen)
+  })
+}
+
+kernel_list <- spectral_normalize_sparse(kernel_list_raw)
 ```
 
-Prepare for sbss:
+Prepare the data:
 
 ```{r}
 X <- data %>%
   st_drop_geometry() %>%
-  select(Value, Centrality, Liquidity) %>%
+  select(Value, Volatility, Liquidity) %>%
   as.matrix()
 
 n <- nrow(X)
-kernel_list_f0 <- c(list(diag(1, n, n)), kernel_list)
-Sf_list_f0 <- lapply(kernel_list_f0, function(kmat) {
+kernel_list <- c(list(Matrix::Diagonal(n)), kernel_list)
+
+# 2. Calculate the scaling factors (Sf_list)
+# This works perfectly on sparse matrices from the Matrix package
+Sf_list <- lapply(kernel_list, function(kmat) {
   sum(kmat) / nrow(kmat)
 })
-Sf_list <- Sf_list_f0[-1]
 ```
 
-We implemented normalization and check if it affects the frjd efficiency.
+For SBSS we do not pass the $f_0$ kernel.
 
 ```{r}
-sbss_res <- sbss(x=X, kernel_list=kernel_list)
-print(sbss_res)
+sbss_res <- sbss(x=X, kernel_list=kernel_list[-1])
+print(sbss_res$w)
 ```
 
-Now we run the spJADE method:
+Now we run the FOBI and JADE methods for iid observations:
 
 ```{r}
-source("../src/spICA.R")
+fobi_res <- FOBI(X)
+print(fobi_res$W)
+
+jade_res <- JADE(X)
+print(jade_res$W)
 ```
 
-Without f0 kernel:
+Now we run spFOBI and spJADE with the $f_0$ kernel.
+
+```{r}
+source("src/spICA.R")
+```
 
 ```{r}
 spjade_res <- spjade(
@@ -83,19 +142,42 @@ print(spjade_res$w)
 ```
 
 ```{r}
-spjade_f0_res <- spjade(
-  x = X, 
-  kernel_list = kernel_list_f0, 
-  Sf_list = Sf_list_f0
+spfobi_res <- spfobi(
+  x = X,
+  kernels = kernel_list
 )
-print(spjade_f0_res$w)
+print(spfobi_res$w)
 ```
 
-Classic JADE:
+We compute statistics between the different methods:\
 
 ```{r}
-jade_res <- JADE(X)
-print(jade_res$W)
+library(spdep)
+
+# 1. Define the specific bandwidth you want to test (e.g., the 1000m scale)
+phi_test <- 1000
+cutoff_dist <- 5 * phi_test # Match the 5*phi tail we used in spJADE
+
+# 2. Extract neighbors using the extended cutoff
+nb_tail <- dnearneigh(coords, d1 = 0, d2 = cutoff_dist)
+dist_list <- nbdists(nb_tail, coords)
+
+# 3. Apply the EXACT Exponential decay function used during extraction
+exp_list <- lapply(dist_list, function(d) exp(-d / phi_test))
+
+# 4. Create the listw object
+# We retain style = "W" specifically to stabilize the global Moran's I variance, 
+# but the relative weights inside the rows now perfectly match your spJADE model.
+listw_exp <- nb2listw(nb_tail, glist = exp_list, style = "W", zero.policy = TRUE)
+```
+
+```{r}
+sources_list <- list(
+  "FOBI"   = fobi_res$S, 
+  "JADE"   = jade_res$S, 
+  "spJADE" = spjade_res$s,
+  "spFOBI" = spfobi_res$s
+)
 ```
 
 Store results to dataset:
@@ -158,78 +240,94 @@ london <- get_tiles(cre_projected, provider="CartoDB.PositronNoLabels", zoom=11)
 Independent component 1
 
 ```{r}
+# Calculate a robust upper limit to handle the 38.74 outlier
+# We'll set the limit at the 99th percentile of the absolute values
+robust_limit <- quantile(abs(cre_projected$spjade_IC1), 0.99, na.rm = TRUE)
+
 IC1_plot <- ggplot(data = cre_projected) +
   layer_spatial(london) +
-  geom_sf(aes(color = spjade_IC1, alpha= abs(spjade_IC1)), size = 0.8, alpha = 1, stroke = 0) +
+  geom_sf(
+    aes(color = spjade_IC1), 
+    size = 0.8, 
+    stroke = 0
+  ) +
   scale_color_gradient2(
-    low = "#5E3C99",
-    mid = "#D9D9D9",
-    high = "#E66101",
-    midpoint = 0,
-    name = ""
+    low = "#5E3C99",    
+    mid = "#F7F7F7",    # Neutral White for near-zero
+    high = "#E66101",   # Burnt Orange for positive
+    midpoint = 0,       # The most important argument
+    name = NULL,
+    limits = c(-robust_limit, robust_limit),
+    oob = scales::squish
   ) +
-  scale_alpha_continuous(
-    range = c(0.10, 1), 
-    limits = c(0, 1), 
-    oob = scales::squish, 
-    guide = "none"
-  ) +
-  theme_void() + theme(
+  theme_void() + 
+  theme(
     legend.position = c(0.93, 0.08),
-    legend.justification = c("right", "bottom")
-  )
+    legend.justification = c("right", "bottom"))
+
 print(IC1_plot)
 ```
 
 Independent component 2:
 
 ```{r}
+# Calculate a robust limit for IC2
+# Since the max is 7.03 and min is -2.68, we can be a bit more precise
+robust_limit_IC2 <- max(abs(range(cre_projected$spjade_IC2, na.rm = TRUE)))
+
 IC2_plot <- ggplot(data = cre_projected) +
   layer_spatial(london) +
-  geom_sf(aes(color = spjade_IC2, alpha= abs(spjade_IC2)), size = 0.8, alpha = 1, stroke = 0) +
+  geom_sf(
+    aes(color = spjade_IC2), 
+    size = 0.8, 
+    stroke = 0
+  ) +
   scale_color_gradient2(
-    low = "#5E3C99",
-    mid = "#D9D9D9",
-    high = "#E66101",
-    midpoint = 0,
-    name = ""
+    low = "#5E3C99",    # Deep Purple (Negative loading)
+    mid = "#F7F7F7",    # Neutral White (Zero loading)
+    high = "#E66101",   # Burnt Orange (Positive loading)
+    midpoint = 0,       # Crucial for zero-centered components
+    name = NULL,
+    # Using the calculated robust limit ensures the color scale is perfectly balanced
+    limits = c(-robust_limit_IC2, robust_limit_IC2),
+    oob = scales::squish
   ) +
-  scale_alpha_continuous(
-    range = c(0.1, 1), 
-    limits = c(0, 2), 
-    oob = scales::squish, 
-    guide = "none"
-  ) +
-  theme_void() + theme(
+  theme_void() + 
+  theme(
     legend.position = c(0.93, 0.08),
-    legend.justification = c("right", "bottom")
-  )
+    legend.justification = c("right", "bottom"))
+
 print(IC2_plot)
 ```
 
 Independent component 3:
 
 ```{r}
+# Calculate a robust limit for IC3 based on the range
+robust_limit_IC3 <- max(abs(range(cre_projected$spjade_IC3, na.rm = TRUE)))
+
 IC3_plot <- ggplot(data = cre_projected) +
   layer_spatial(london) +
-  geom_sf(aes(color = spjade_IC3, alpha= abs(spjade_IC3)), size = 0.8, alpha = 1, stroke = 0) +
+  geom_sf(
+    aes(color = spjade_IC3), 
+    size = 0.8, 
+    stroke = 0
+  ) +
   scale_color_gradient2(
-    low = "#5E3C99",
-    mid = "#D9D9D9",
-    high = "#E66101",
-    midpoint = 0,
-    name = ""
+    low = "#5E3C99",    # Deep Purple (Negative)
+    mid = "#F7F7F7",    # Neutral White (Zero)
+    high = "#E66101",   # Burnt Orange (Positive)
+    midpoint = 0,       
+    name = NULL,
+    limits = c(-robust_limit_IC3, robust_limit_IC3),
+    oob = scales::squish
   ) +
-  scale_alpha_continuous(
-    range = c(0.1, 1), 
-    limits = c(0, 2.5), 
-    oob = scales::squish, 
-    guide = "none"
-  ) +
-  theme_void() + theme(
+  theme_void() + 
+  theme(
     legend.position = c(0.93, 0.08),
     legend.justification = c("right", "bottom")
   )
+
 print(IC3_plot)
 ```
 
@@ -239,255 +337,326 @@ for (i in 1:3){
 }
 
 for (i in 1:3){
+  print(kurtosis(fobi_res$S[, i]))
+}
+
+for (i in 1:3){
   print(kurtosis(spjade_res$s[, i]))
 }
 
-for (i in 1:3){
-  print(kurtosis(spjade_f0_res$s[, i]))
-}
+```
 
-for (i in 1:3){
-  print(kurtosis(sbss_res$s[, i]))
-}
+spFOBI IC1
+
+```{r}
+robust_limit <- quantile(abs(cre_projected$spfobi_IC1), 0.99, na.rm = TRUE)
+
+IC1_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = spfobi_IC1), 
+    size = 0.8, 
+    stroke = 0
+  ) +
+  scale_color_gradient2(
+    low = "#5E3C99",    
+    mid = "#F7F7F7",    # Neutral White for near-zero
+    high = "#E66101",   # Burnt Orange for positive
+    midpoint = 0,       # The most important argument
+    name = NULL,
+    limits = c(-robust_limit, robust_limit),
+    oob = scales::squish
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom"))
+
+print(IC1_plot)
+```
+
+spFOBI IC2:
+
+```{r}
+robust_limit <- quantile(abs(cre_projected$spfobi_IC2), 0.99, na.rm = TRUE)
+
+IC2_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = spfobi_IC2), 
+    size = 0.8, 
+    stroke = 0
+  ) +
+  scale_color_gradient2(
+    low = "#5E3C99",    
+    mid = "#F7F7F7",    # Neutral White for near-zero
+    high = "#E66101",   # Burnt Orange for positive
+    midpoint = 0,       # The most important argument
+    name = NULL,
+    limits = c(-robust_limit, robust_limit),
+    oob = scales::squish
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom"))
+
+print(IC2_plot)
+```
+
+IC3 for spFOBI
+
+```{r}
+robust_limit <- quantile(abs(cre_projected$spfobi_IC3), 0.99, na.rm = TRUE)
+
+IC3_plot <- ggplot(data = cre_projected) +
+  layer_spatial(london) +
+  geom_sf(
+    aes(color = spfobi_IC3), 
+    size = 0.8, 
+    stroke = 0
+  ) +
+  scale_color_gradient2(
+    low = "#5E3C99",    
+    mid = "#F7F7F7",    # Neutral White for near-zero
+    high = "#E66101",   # Burnt Orange for positive
+    midpoint = 0,       # The most important argument
+    name = NULL,
+    limits = c(-robust_limit, robust_limit),
+    oob = scales::squish
+  ) +
+  theme_void() + 
+  theme(
+    legend.position = c(0.93, 0.08),
+    legend.justification = c("right", "bottom"))
+
+print(IC3_plot)
 ```
 
 We assign components to reorganize them accordingly.
 
 ```{r}
-cre$jade_IC1 <- jade_res$S[, 1]
-cre$jade_IC2 <- jade_res$S[, 3]
-cre$jade_IC3 <- jade_res$S[, 2]
+cre_projected$spjade_IC1 <- spjade_res$s[, 1]
+cre_projected$spjade_IC2 <- spjade_res$s[, 2]
+cre_projected$spjade_IC3 <- spjade_res$s[, 3]
 
-cre$spjade_f0_IC1 <- spjade_f0_res$s[, 1]
-cre$spjade_f0_IC2 <- spjade_f0_res$s[, 2]
-cre$spjade_f0_IC3 <- spjade_f0_res$s[, 3]
+cre_projected$jade_IC1 <- jade_res$S[, 1]
+cre_projected$jade_IC2 <- jade_res$S[, 2]
+cre_projected$jade_IC3 <- jade_res$S[, 3]
 
-cre$sbss_IC1 <- sbss_res$s[, 3]
-cre$sbss_IC2 <- sbss_res$s[, 1]
-cre$sbss_IC3 <- sbss_res$s[, 2]
+cre_projected$spfobi_IC1 <- spfobi_res$s[, 1]
+cre_projected$spfobi_IC2 <- spfobi_res$s[, 2]
+cre_projected$spfobi_IC3 <- spfobi_res$s[, 3]
+
+cre_projected$fobi_IC1 <- fobi_res$S[, 1]
+cre_projected$fobi_IC2 <- fobi_res$S[, 2]
+cre_projected$fobi_IC3 <- fobi_res$S[, 3]
 ```
 
-Create spatial neighbor list for Moran's I.
+Loadings of the components:
 
 ```{r}
-coords <- st_coordinates(cre)
-knn_obj <- knearneigh(coords, k = 6)
-nb_obj <- knn2nb(knn_obj)
-W_list <- nb2listw(nb_obj, style = "W", zero.policy = TRUE)
-```
 
-```{r}
-m_jade1 <- moran.test(as.numeric(cre$jade_IC1), W_list)
-m_spjade1 <- moran.test(as.numeric(cre$spjade_IC1), W_list)
-m_spjade_f0_1 <- moran.test(as.numeric(cre$spjade_f0_IC1), W_list)
-m_sbss1 <- moran.test(as.numeric(cre$sbss_IC1), W_list)
+W_sbss <- coef(sbss_res) 
 
+loadings_sbss <- solve(W_sbss)
 
-comparison_IC1 <- data.frame(
-  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
-  Moran_I = c(m_jade1$estimate[1],
-              m_spjade1$estimate[1],
-              m_spjade_f0_1$estimate[1],
-              m_sbss1$estimate[1]
-              )
-)
-comparison_IC1
-```
+W_fobi <- coef(fobi_res)
+loadings_fobi <- solve(W_fobi)
 
-```{r}
-m_jade2 <- moran.test(as.numeric(cre$jade_IC2), W_list)
-m_spjade2 <- moran.test(as.numeric(cre$spjade_IC2), W_list)
-m_spjade_f0_2 <- moran.test(as.numeric(cre$spjade_f0_IC2), W_list)
-m_sbss2 <- moran.test(as.numeric(cre$sbss_IC2), W_list)
+W_jade <- coef(jade_res)
+loadings_jade <- solve(W_jade)
 
+W_spjade <- coef(spjade_res)
+loadings_spjade <- solve(W_spjade)
 
-comparison_IC2 <- data.frame(
-  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
-  Moran_I = c(m_jade2$estimate[1],
-              m_spjade2$estimate[1],
-              m_spjade_f0_2$estimate[1],
-              m_sbss2$estimate[1]
-  )
-)
-comparison_IC2
+W_spfobi <- coef(spfobi_res)
+loadings_spfobi <- solve(W_spfobi)
 ```
 
 ```{r}
-m_jade3 <- moran.test(as.numeric(cre$jade_IC3), W_list)
-m_spjade3 <- moran.test(as.numeric(cre$spjade_IC3), W_list)
-m_spjade_f0_3 <- moran.test(as.numeric(cre$spjade_f0_IC3), W_list)
-m_sbss3 <- moran.test(as.numeric(cre$sbss_IC3), W_list)
+# Load required libraries
+library(ggplot2)
+library(tidyr)
+library(dplyr)
 
-
-comparison_IC3 <- data.frame(
-  Method = c("JADE", "spJADE", "spJADE_f0", "SBSS"),
-  Moran_I = c(m_jade3$estimate[1],
-              m_spjade3$estimate[1],
-              m_spjade_f0_3$estimate[1],
-              m_sbss3$estimate[1]
-  )
-)
-comparison_IC3
-```
-
-Variograms:
-
-```{r}
-vario_jade1   <- variogram(cre$jade_IC1 ~ 1, locations = cre)
-vario_spjade1 <- variogram(cre$spjade_IC1 ~ 1, locations = cre)
-vario_spjade_f0_1 <- variogram(cre$spjade_f0_IC1 ~ 1, locations = cre)
-vario_sbss1 <- variogram(cre$sbss_IC1 ~ 1, locations = cre)
-
-combined_vario1 <- rbind(
-  cbind(vario_jade1, method = "JADE"),
-  cbind(vario_spjade1, method = "spJADE"),
-  cbind(vario_spjade_f0_1, method = "spJADE_f0"),
-  cbind(vario_sbss1, method = "SBSS")
-)
-
-ggplot(combined_vario1, aes(x = dist, y = gamma, color = method, shape = method)) +
-  geom_line() +
-  geom_point(size = 3) +
-  theme_minimal() +
-  labs(title = "Spatial Structure Comparison: IC1",
-       x = "Distance (meters)",
-       y = "Semivariance") +
-  scale_color_manual(values = c("JADE" = "blue",
-                                "spJADE" = "red",
-                                "spJADE_f0" = "green",
-                                "SBSS"= "violet"))
-```
-
-```{r}
-vario_jade2   <- variogram(cre$jade_IC2 ~ 1, locations = cre)
-vario_spjade2 <- variogram(cre$spjade_IC2 ~ 1, locations = cre)
-vario_spjade_f0_2 <- variogram(cre$spjade_f0_IC2 ~ 1, locations = cre)
-vario_sbss2 <- variogram(cre$sbss_IC2 ~ 1, locations = cre)
-
-combined_vario2 <- rbind(
-  cbind(vario_jade2, method = "JADE"),
-  cbind(vario_spjade2, method = "spJADE"),
-  cbind(vario_spjade_f0_2, method = "spJADE_f0"),
-  cbind(vario_sbss2, method = "SBSS")
-)
-
-
-ggplot(combined_vario2, aes(x = dist, y = gamma, color = method, shape = method)) +
-  geom_line() +
-  geom_point(size = 3) +
-  theme_minimal() +
-  labs(title = "Spatial Structure Comparison: IC2",
-       x = "Distance (meters)",
-       y = "Semivariance") +
-  scale_color_manual(values = c("JADE" = "blue",
-                                "spJADE" = "red",
-                                "spJADE_f0" = "green",
-                                "SBSS"= "violet"))
-```
-
-```{r}
-vario_jade3   <- variogram(cre$jade_IC3 ~ 1, locations = cre)
-vario_spjade3 <- variogram(cre$spjade_IC3 ~ 1, locations = cre)
-vario_spjade_f0_3 <- variogram(cre$spjade_f0_IC3 ~ 1, locations = cre)
-vario_sbss3 <- variogram(cre$sbss_IC3 ~ 1, locations = cre)
-
-combined_vario <- rbind(
-  cbind(vario_jade3, method = "JADE"),
-  cbind(vario_spjade3, method = "spJADE"),
-  cbind(vario_spjade_f0_3, method = "spJADE_f0"),
-  cbind(vario_sbss3, method = "SBSS")
-)
-
-
-ggplot(combined_vario, aes(x = dist, y = gamma, color = method, shape = method)) +
-  geom_line() +
-  geom_point(size = 3) +
-  theme_minimal() +
-  labs(title = "Spatial Structure Comparison: IC3",
-       x = "Distance (meters)",
-       y = "Semivariance") +
-  scale_color_manual(values = c("JADE" = "blue",
-                                "spJADE" = "red",
-                                "spJADE_f0" = "green",
-                                "SBSS"= "violet"))
-```
-
-Final table for each component:
-
-```{r}
-get_spatial_metrics <- function(vario_obj, method_name) {
-  nugget <- vario_obj$gamma[1]
-  sill <- max(vario_obj$gamma)
-  nugget_sill_ratio <- nugget / sill
+# 1. Helper function
+prepare_heatmap_data <- function(loadings_mat, model_name) {
+  colnames(loadings_mat) <- paste0("IC", 1:ncol(loadings_mat))
   
-  effective_range <- vario_obj$dist[which.max(vario_obj$gamma)]
+  if (is.null(rownames(loadings_mat))) {
+    rownames(loadings_mat) <- paste0("Var", 1:nrow(loadings_mat))
+  }
   
-  data.frame(
-    Method = method_name,
-    Nugget = round(nugget, 4),
-    Sill = round(sill, 4),
-    Ratio = round(nugget_sill_ratio, 4),
-    Range_Meters = round(effective_range, 0)
-  )
+  df <- as.data.frame(loadings_mat)
+  df$Variable <- factor(rownames(df), levels = rev(rownames(df))) 
+  
+  df_long <- pivot_longer(df, 
+                          cols = starts_with("IC"), 
+                          names_to = "Component", 
+                          values_to = "Loading")
+  
+  df_long$Model <- model_name
+  
+  return(df_long)
 }
 
-calculate_entropy <- function(vec) {
-  counts <- table(cut(vec, breaks = 50))
-  p <- counts / sum(counts)
-  p <- p[p > 0]
-  -sum(p * log(p))
+# 2. Process all five models
+df_sbss   <- prepare_heatmap_data(loadings_sbss, "1. SBSS")
+df_fobi   <- prepare_heatmap_data(loadings_fobi, "2. FOBI")
+df_jade   <- prepare_heatmap_data(loadings_jade, "3. JADE")
+df_spfobi <- prepare_heatmap_data(loadings_spfobi, "4. spFOBI")
+df_spjade <- prepare_heatmap_data(loadings_spjade, "5. spJADE")
+
+# 3. Combine into one master dataset
+all_loadings <- bind_rows(df_sbss, df_fobi, df_jade, df_spfobi, df_spjade)
+
+# 4. THE FIX: Normalize strictly within each Model AND Variable (Row-wise)
+all_loadings <- all_loadings %>%
+  group_by(Model, Variable) %>% # <--- Changed from Component to Variable
+  mutate(Norm_Loading = Loading / max(abs(Loading))) %>%
+  ungroup()
+
+# 5. Generate the faceted heatmap
+heatmap_plot <- ggplot(all_loadings, aes(x = Component, y = Variable, fill = Norm_Loading)) +
+  geom_tile(color = "gray90", linewidth = 0.5) + 
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0,
+                       limits = c(-1, 1),
+                       name = "Loadings") +
+  facet_wrap(~ Model, nrow = 1) + 
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "Latent Component",
+    y = "Observed Variable"
+  )
+
+# Display the plot
+print(heatmap_plot)
+```
+
+Mutual independence
+
+```{r}
+library(sf)
+library(spdep)
+library(knitr)
+
+# Helper function to get the top 3 Moran's I values
+get_top3_morans <- function(data, prefix, weights) {
+  df_clean <- st_drop_geometry(data)
+  
+  # FIX 1: Ignore case and drop the strict "_IC" requirement to match names like "spJADE_1"
+  cols <- grep(paste0("^", prefix), names(df_clean), value = TRUE, ignore.case = TRUE)
+  
+  # SAFETY CATCH: If columns still aren't found, stop and print exactly why
+  if (length(cols) == 0) {
+    stop(paste("No columns found in the dataset starting with:", prefix))
+  }
+  
+  # FIX 2: unlist() ensures the result is an atomic vector, and drop = FALSE 
+  # prevents subsetting issues if only one column accidentally matches
+  morans <- unlist(sapply(df_clean[, cols, drop = FALSE], function(x) {
+    moran.test(x, weights)$estimate[1] 
+  }))
+  
+  # Sort decreasing and return exactly the first 3 values
+  top3 <- sort(morans, decreasing = TRUE)[1:3]
+  return(top3)
 }
 
+# Construct the results data frame
+results_all_morans <- data.frame(
+  Methodology = c("spJADE", "spFOBI", "JADE", "FOBI"),
+  IC1 = c(
+    get_top3_morans(cre_projected, "spjade", listw_exp)[1],
+    get_top3_morans(cre_projected, "spfobi", listw_exp)[1],
+    get_top3_morans(cre_projected, "jade", listw_exp)[1],
+    get_top3_morans(cre_projected, "fobi", listw_exp)[1] # Make sure "fobi" is your actual prefix
+  ),
+  IC2 = c(
+    get_top3_morans(cre_projected, "spjade", listw_exp)[2],
+    get_top3_morans(cre_projected, "spfobi", listw_exp)[2],
+    get_top3_morans(cre_projected, "jade", listw_exp)[2],
+    get_top3_morans(cre_projected, "fobi", listw_exp)[2]
+  ),
+  IC3 = c(
+    get_top3_morans(cre_projected, "spjade", listw_exp)[3],
+    get_top3_morans(cre_projected, "spfobi", listw_exp)[3],
+    get_top3_morans(cre_projected, "jade", listw_exp)[3],
+    get_top3_morans(cre_projected, "fobi", listw_exp)[3]
+  )
+)
+
+# Generate the LaTeX code
+kable(results_all_morans, 
+      format = "latex", 
+      booktabs = TRUE, 
+      digits = 4, 
+      col.names = c("Methodology", "Component 1", "Component 2", "Component 3"),
+      caption = "Spatial autocorrelation (Moran's $I$) decay profile across the first three extracted components.",
+      label = "tab:morans_decay",
+      escape = FALSE)
 ```
 
 ```{r}
-table_metrics <- rbind(
-  get_spatial_metrics(vario_jade1, "JADE"),
-  get_spatial_metrics(vario_spjade1, "spJADE"),
-  get_spatial_metrics(vario_spjade_f0_1, "spJADE_f0"),
-  get_spatial_metrics(vario_sbss1, "SBSS")
+library(sf)
+library(knitr)
+
+# Helper function to get the top 3 absolute excess kurtosis values
+get_top3_kurtosis <- function(data, prefix) {
+  df_clean <- st_drop_geometry(data)
+  cols <- grep(paste0("^", prefix, "_IC"), names(df_clean), value = TRUE)
+  
+  # Calculate absolute excess kurtosis for all components
+  kurts <- sapply(df_clean[, cols], function(x) {
+    n <- length(x)
+    mean_x <- mean(x, na.rm = TRUE)
+    sd_x <- sd(x, na.rm = TRUE)
+    # Excess kurtosis formula
+    kurt <- sum((x - mean_x)^4, na.rm = TRUE) / (n * sd_x^4) - 3
+    return(abs(kurt))
+  })
+  
+  # Sort decreasing and return exactly the first 3 values
+  top3 <- sort(kurts, decreasing = TRUE)[1:3]
+  return(top3)
+}
+
+# Construct the results data frame
+results_all_kurts <- data.frame(
+  Methodology = c("Standard JADE", "Standard FOBI","Spatial JADE"),
+  IC1 = c(
+    get_top3_kurtosis(cre_projected, "jade")[1],
+    get_top3_kurtosis(cre_projected, "spjade")[1],
+    get_top3_kurtosis(cre_projected, "fobi")[1]
+  ),
+  IC2 = c(
+    get_top3_kurtosis(cre_projected, "jade")[2],
+    get_top3_kurtosis(cre_projected, "spjade")[2],
+    get_top3_kurtosis(cre_projected, "fobi")[2]
+  ),
+  IC3 = c(
+    get_top3_kurtosis(cre_projected, "jade")[3],
+    get_top3_kurtosis(cre_projected, "spjade")[3],
+    get_top3_kurtosis(cre_projected, "fobi")[3]
+  )
 )
 
-table_metrics$Entropy <- c(
-  calculate_entropy(jade_res$S[,1]),
-  calculate_entropy(spjade_res$s[,1]),
-  calculate_entropy(spjade_f0_res$s[,1]),
-  calculate_entropy(sbss_res$s[,1])
-)
-
-print(table_metrics)
-```
-
-```{r}
-table_metrics <- rbind(
-  get_spatial_metrics(vario_jade2, "JADE"),
-  get_spatial_metrics(vario_spjade2, "spJADE"),
-  get_spatial_metrics(vario_spjade_f0_2, "spJADE_f0"),
-  get_spatial_metrics(vario_sbss2, "SBSS")
-)
-
-table_metrics$Entropy <- c(
-  calculate_entropy(jade_res$S[,2]),
-  calculate_entropy(spjade_res$s[,2]),
-  calculate_entropy(spjade_f0_res$s[,2]),
-  calculate_entropy(sbss_res$s[,2])
-)
-print(table_metrics)
-```
-
-```{r}
-table_metrics <- rbind(
-  get_spatial_metrics(vario_jade3, "JADE"),
-  get_spatial_metrics(vario_spjade3, "spJADE"),
-  get_spatial_metrics(vario_spjade_f0_3, "spJADE_f0"),
-  get_spatial_metrics(vario_sbss3, "SBSS")
-)
-
-table_metrics$Entropy <- c(
-  calculate_entropy(jade_res$S[,3]),
-  calculate_entropy(spjade_res$s[,3]),
-  calculate_entropy(spjade_f0_res$s[,3]),
-  calculate_entropy(sbss_res$s[,3])
-)
-print(table_metrics)
+# Generate the LaTeX code
+kable(results_all_kurts, 
+      format = "latex", 
+      booktabs = TRUE, 
+      digits = 4, 
+      col.names = c("Methodology", "Component 1", "Component 2", "Component 3"),
+      caption = "Absolute excess kurtosis ($|\\kappa|$) profile across the top three extracted components. Higher values indicate stronger isolation of non-Gaussian economic signals.",
+      label = "tab:kurtosis_profile",
+      escape = FALSE)
 ```
